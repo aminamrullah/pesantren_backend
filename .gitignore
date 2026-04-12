@@ -1,0 +1,6 @@
+node_modules/
+.env
+.env.backup
+.env.production
+dist/
+npm-debug.log*
