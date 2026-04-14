@@ -9,7 +9,6 @@ const hpp = require('hpp');
 const jwt = require('jsonwebtoken');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
-const xss = require('xss-clean');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -58,7 +57,6 @@ const limiter = rateLimit({
     message: 'Too many requests from this IP, please try again after 15 minutes.'
 });
 app.use('/api/', limiter);
-app.use(xss());
 
 const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
