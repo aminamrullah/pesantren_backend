@@ -30,7 +30,7 @@ async function xenditRequest(path, method = 'GET', body = null, forUserId = null
     };
     if (forUserId) opts.headers['for-user-id'] = forUserId;
     if (body) opts.body = JSON.stringify(body);
-    
+
     const baseUrl = process.env.XENDIT_API_URL || 'https://api.xendit.co';
     const resp = await fetch(`${baseUrl}${path}`, opts);
     const data = await resp.json();
@@ -58,7 +58,7 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
-const allowedOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : ['http://localhost:5173'];
+const allowedOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim()) : ['http://localhost:5173'];
 app.use(cors({
     origin: (origin, callback) => {
         if (!origin || allowedOrigins.includes(origin)) {
@@ -150,21 +150,19 @@ app.post('/api/login', async (req, res) => {
             LEFT JOIN roles r ON mhr.role_id = r.id
             LEFT JOIN teachers t ON u.id = t.user_id
             WHERE u.phone = ? OR u.email = ?`, ['App\\Models\\User', phone, phone]);
-        
+
         console.log(`[LOGIN DEBUG] Phone: ${phone}, Found: ${users.length}, Role: ${users[0]?.role}`);
-        
+
         if (users.length === 0) return res.status(401).json({ message: 'Nomor WhatsApp tidak terdaftar.' });
 
         const user = users[0];
         const valid = await bcrypt.compare(password, user.password);
         if (!valid) return res.status(401).json({ message: 'Password salah.' });
 
-        const token = jwt.sign(
-            { id: user.id, phone: user.phone || phone, name: user.name, role: user.role, can_access_terminal: !!user.can_access_terminal },
-            process.env.JWT_SECRET,
-            { expiresIn: process.env.JWT_EXPIRE || '24h' }
-        );
+        // Get all roles for access checking
+        const userRoles = users.map(u => u.role).filter(Boolean);
 
+        // Fetch students associated with this user's phone to verify if they are a wali santri
         const [students] = await db.execute(`
             SELECT s.*, w.id as wallet_id, c.name as classroom_name, d.name as dormitory_name, d.mushrif_name, dr.name as room_name, t.name as homeroom_teacher_name
             FROM students s
@@ -175,18 +173,39 @@ app.post('/api/login', async (req, res) => {
             LEFT JOIN teachers t ON c.homeroom_teacher_id = t.id
             WHERE s.parent_phone = ?`, [user.phone || phone]);
 
-        res.json({ 
-            token, 
-            user: { 
-                id: user.id, 
-                name: user.name, 
-                email: user.email, 
-                phone: user.phone, 
-                role: user.role, 
+        // Authorization Logic:
+        // 1. If has 'Wali' role -> OK
+        // 2. If has students -> OK (this covers Teachers/Admins who are also Parents)
+        // 3. Admin bypass (typically included for management/testing)
+        const isWali = userRoles.includes('Wali');
+        const isAdmin = userRoles.includes('Admin');
+        const isParent = students.length > 0;
+
+        if (!isWali && !isParent && !isAdmin) {
+            console.log(`[LOGIN REJECTED] User ${user.name} (${phone}) - Roles: ${userRoles.join(',')}, Students: ${students.length}`);
+            return res.status(403).json({
+                message: 'Akses ditolak. Aplikasi ini hanya dapat diakses oleh Wali Santri.'
+            });
+        }
+
+        const token = jwt.sign(
+            { id: user.id, phone: user.phone || phone, name: user.name, role: user.role, can_access_terminal: !!user.can_access_terminal },
+            process.env.JWT_SECRET,
+            { expiresIn: process.env.JWT_EXPIRE || '24h' }
+        );
+
+        res.json({
+            token,
+            user: {
+                id: user.id,
+                name: user.name,
+                email: user.email,
+                phone: user.phone,
+                role: user.role,
                 is_tahfidz_teacher: !!user.is_tahfidz_teacher,
                 can_access_terminal: !!user.can_access_terminal
-            }, 
-            students 
+            },
+            students
         });
     } catch (err) {
         console.error(err);
@@ -579,12 +598,12 @@ app.post('/api/xendit/webhook', async (req, res) => {
                         await connection.execute('UPDATE donations SET payment_status = "success" WHERE id = ?', [donation.id]);
                         await connection.execute('UPDATE donation_campaigns SET collected_amount = collected_amount + ? WHERE id = ?', [donation.amount, donation.campaign_id]);
                         await connection.commit();
-                        
+
                         // Add Notification
                         if (donation.user_id) {
                             await createNotification(donation.user_id, 'donation', 'Donasi Berhasil', `Terima kasih! Donasi sebesar Rp ${Number(donation.amount).toLocaleString('id-ID')} untuk program donasi telah kami terima.`);
                         }
-                        
+
                         console.log('[WEBHOOK] Donation success:', externalId);
                         return res.json({ received: true });
                     } catch (err) {
@@ -608,7 +627,7 @@ app.post('/api/xendit/webhook', async (req, res) => {
                         console.log('[WEBHOOK] Split Payment success for transaction id:', txs[0].id);
                         return res.json({ received: true });
                     }
-                } catch(err) {
+                } catch (err) {
                     console.error('[WEBHOOK Split Payment Error]', err);
                 }
             }
@@ -650,7 +669,7 @@ app.post('/api/xendit/webhook', async (req, res) => {
                         await connection.execute(
                             "UPDATE topup_logs SET status = 'success', paid_at = NOW() WHERE external_id = ?",
                             [externalId]);
-                            
+
                         // Find user to notify
                         const [users] = await connection.execute('SELECT u.id, s.name FROM users u JOIN students s ON s.parent_phone = u.phone WHERE s.id = ?', [bill.student_id]);
                         if (users.length > 0) {
@@ -789,8 +808,8 @@ app.post('/api/topup/demo-complete', protect, async (req, res) => {
         await connection.commit();
 
         // Notification for guardian
-        await createNotification(req.user.id, 'topup', 'Top Up Berhasil (Simulasi)', 
-            `Pengisian saldo Rp ${Number(log.amount).toLocaleString('id-ID')} untuk ${wallet.student_name} telah berhasil disimulasikan.`, 
+        await createNotification(req.user.id, 'topup', 'Top Up Berhasil (Simulasi)',
+            `Pengisian saldo Rp ${Number(log.amount).toLocaleString('id-ID')} untuk ${wallet.student_name} telah berhasil disimulasikan.`,
             { wallet_id: wallet.id });
 
         res.json({ message: 'Top up berhasil disimulasikan.', new_balance: after });
@@ -1033,8 +1052,8 @@ app.post('/api/bills/demo-complete', protect, async (req, res) => {
         await connection.commit();
 
         // Notification for guardian
-        await createNotification(req.user.id, 'payment', 'Pembayaran Tagihan Berhasil (Simulasi)', 
-            `Pembayaran tagihan sebesar Rp ${Number(log.amount).toLocaleString('id-ID')} via Gateway (Simulasi) berhasil.`, 
+        await createNotification(req.user.id, 'payment', 'Pembayaran Tagihan Berhasil (Simulasi)',
+            `Pembayaran tagihan sebesar Rp ${Number(log.amount).toLocaleString('id-ID')} via Gateway (Simulasi) berhasil.`,
             { bill_id: bill_id });
 
         res.json({ message: 'Pembayaran tagihan berhasil.', reference: refNo });
@@ -1167,10 +1186,10 @@ app.post('/api/admin/canteen-purchase', protectAdmin, async (req, res) => {
             FROM users u 
             JOIN students s ON s.parent_phone = u.phone 
             WHERE s.id = ?`, [wallet.student_id]);
-            
+
         if (rows.length > 0) {
-            await createNotification(rows[0].user_id, 'canteen', 'Transaksi Kantin', 
-                `Ananda ${rows[0].student_name} baru saja jajan di kantin sebesar Rp ${Number(amount).toLocaleString('id-ID')}.`, 
+            await createNotification(rows[0].user_id, 'canteen', 'Transaksi Kantin',
+                `Ananda ${rows[0].student_name} baru saja jajan di kantin sebesar Rp ${Number(amount).toLocaleString('id-ID')}.`,
                 { wallet_id: wallet.id });
         }
 
@@ -1223,10 +1242,10 @@ app.post('/api/admin/withdraw', protectAdmin, async (req, res) => {
             FROM users u 
             JOIN students s ON s.parent_phone = u.phone 
             WHERE s.id = ?`, [wallet.student_id]);
-            
+
         if (rows2.length > 0) {
-            await createNotification(rows2[0].user_id, 'withdrawal', 'Penarikan Tunai', 
-                `Penarikan tunai Rp ${Number(amount).toLocaleString('id-ID')} untuk Ananda ${rows2[0].student_name} telah diproses oleh admin.`, 
+            await createNotification(rows2[0].user_id, 'withdrawal', 'Penarikan Tunai',
+                `Penarikan tunai Rp ${Number(amount).toLocaleString('id-ID')} untuk Ananda ${rows2[0].student_name} telah diproses oleh admin.`,
                 { wallet_id: wallet.id });
         }
 
@@ -1374,7 +1393,7 @@ app.post('/api/terminal/verify', async (req, res) => {
             WHERE s.rfid = ?`, [rfid]);
 
         if (students.length === 0) return res.status(404).json({ message: 'ID Kartu tidak dikenali.' });
-        
+
         const student = students[0];
         res.json({ student });
     } catch (err) {
@@ -1388,7 +1407,7 @@ app.post('/api/terminal/transaction', async (req, res) => {
     await connection.beginTransaction();
     try {
         const { rfid, pin, amount, type, description } = req.body; // type: 'purchase', 'withdrawal', 'deposit'
-        
+
         if (!rfid || !amount || !type) {
             await connection.rollback();
             return res.status(400).json({ message: 'Input tidak lengkap.' });
@@ -1412,7 +1431,7 @@ app.post('/api/terminal/transaction', async (req, res) => {
             await connection.rollback();
             return res.status(401).json({ message: 'PIN Salah.' });
         }
-        
+
         if (!student.pin) {
             await connection.rollback();
             return res.status(400).json({ message: 'PIN belum diatur oleh Wali Santri. Atur PIN di menu Profil.' });
@@ -1435,7 +1454,7 @@ app.post('/api/terminal/transaction', async (req, res) => {
 
         // 2. Update Balance
         await connection.execute('UPDATE wallets SET balance = ? WHERE id = ?', [after, student.wallet_id]);
-        
+
         // 3. Log Transaction
         await connection.execute(`
             INSERT INTO wallet_transactions (wallet_id, type, amount, balance_before, balance_after, reference, description)
@@ -1449,8 +1468,8 @@ app.post('/api/terminal/transaction', async (req, res) => {
         if (users.length > 0) {
             const label = type === 'purchase' ? 'Pembelian Kantin' : (type === 'withdrawal' ? 'Tarik Tunai' : 'Setor Tunai');
             const verb = type === 'deposit' ? 'berhasil menyetor' : 'baru saja menarik/menggunakan';
-            await createNotification(users[0].id, type, label, 
-                `Ananda ${student.name} ${verb} dana sebesar Rp ${Number(amount).toLocaleString('id-ID')} via Kartu RFID.`, 
+            await createNotification(users[0].id, type, label,
+                `Ananda ${student.name} ${verb} dana sebesar Rp ${Number(amount).toLocaleString('id-ID')} via Kartu RFID.`,
                 { wallet_id: student.wallet_id, type });
         }
 
@@ -1516,7 +1535,7 @@ app.get('/api/donations/campaigns/:id', async (req, res) => {
             LEFT JOIN users u ON d.user_id = u.id 
             WHERE d.campaign_id = ? AND d.payment_status = "success" 
             ORDER BY d.created_at DESC, d.id DESC LIMIT 10`, [req.params.id]);
-        
+
         const [distributions] = await db.execute('SELECT * FROM donation_distributions WHERE campaign_id = ? ORDER BY distribution_date DESC', [req.params.id]);
 
         res.json({ campaign: campaigns[0], recent_donations: donations, distributions });
@@ -1535,7 +1554,7 @@ app.post('/api/donations', async (req, res) => {
         const amount = Number(req.body.amount);
         const payment_method = req.body.payment_method;
         const notes = req.body.notes || null;
-        
+
         console.log(`[DONATION] Attempting donation: ${amount} to campaign ${campaign_id} via ${payment_method}`);
 
         // Auth is optional for donations but if token present, use it
@@ -1631,11 +1650,11 @@ app.post('/api/donations', async (req, res) => {
 
             await connection.commit();
             console.log(`[DONATION] Success creating gateway invoice: ${externalId}`);
-            return res.json({ 
+            return res.json({
                 successRedirectUrl: process.env.XENDIT_SUCCESS_URL || 'http://localhost:3000/wallet',
                 failureRedirectUrl: process.env.XENDIT_FAILURE_URL || 'http://localhost:3000/wallet',
                 reference_no: externalId,
-                demo_mode: !process.env.XENDIT_SECRET_KEY 
+                demo_mode: !process.env.XENDIT_SECRET_KEY
             });
         }
 
@@ -1745,11 +1764,11 @@ app.get('/api/teacher/students', protect, async (req, res) => {
     try {
         const userId = req.user.id;
         const [teachers] = await db.execute('SELECT id FROM teachers WHERE user_id = ?', [userId]);
-        
+
         if (teachers.length === 0) {
             return res.status(403).json({ message: 'Akses ditolak. Profil guru tidak ditemukan.' });
         }
-        
+
         const teacherId = teachers[0].id;
 
         const [rows] = await db.execute(`
@@ -1770,14 +1789,14 @@ app.post('/api/teacher/tahfidz', protect, async (req, res) => {
     try {
         const userId = req.user.id;
         const [teachers] = await db.execute('SELECT id FROM teachers WHERE user_id = ?', [userId]);
-        
+
         if (teachers.length === 0) {
             return res.status(403).json({ message: 'Akses ditolak. Profil guru tidak ditemukan.' });
         }
-        
+
         const teacherId = teachers[0].id;
         const { student_id, type, content, status, note, date } = req.body;
-        
+
         if (!student_id || !type || !content || !status) {
             return res.status(400).json({ message: 'Data setoran tidak lengkap.' });
         }
@@ -1792,7 +1811,7 @@ app.post('/api/teacher/tahfidz', protect, async (req, res) => {
             INSERT INTO tahfidz_records (student_id, teacher_id, type, content, date, status, note, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
             [student_id, teacherId, type, content, date || new Date().toISOString().split('T')[0], status, note || '']);
-        
+
         res.json({ message: 'Catatan hafalan berhasil disimpan.' });
     } catch (err) {
         console.error(err);
@@ -1810,18 +1829,18 @@ app.get('/api/teacher/my-classroom', protect, async (req, res) => {
             SELECT c.* 
             FROM classrooms c
             WHERE c.homeroom_teacher_id = ?`, [userId]);
-        
+
         if (rows.length === 0) return res.json(null);
-        
+
         const classroom = rows[0];
-        
+
         // Fetch students in this class
         const [students] = await db.execute(`
             SELECT id, nis, name, gender, photo
             FROM students
             WHERE classroom_id = ? AND status = 'active'
             ORDER BY name ASC`, [classroom.id]);
-        
+
         classroom.students = students;
 
         // Fetch full schedule for this classroom
@@ -1832,7 +1851,7 @@ app.get('/api/teacher/my-classroom', protect, async (req, res) => {
             JOIN users u ON sch.teacher_id = u.id
             WHERE sch.classroom_id = ?
             ORDER BY FIELD(sch.day, 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu', 'Minggu'), sch.start_time ASC`, [classroom.id]);
-        
+
         classroom.schedule = schedule;
         res.json(classroom);
     } catch (err) {
@@ -1911,7 +1930,7 @@ app.post('/api/teacher/grades', protect, async (req, res) => {
             INSERT INTO student_grades (student_id, subject_id, teacher_id, academic_year_id, semester, type, score, note, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
             [student_id, subject_id, userId, academic_year_id, semester, type, score, note || '']);
-        
+
         res.json({ message: 'Nilai berhasil disimpan.' });
     } catch (err) {
         console.error(err);
@@ -1924,7 +1943,7 @@ app.post('/api/teacher/grades', protect, async (req, res) => {
 app.get('/api/teacher/activity', protect, async (req, res) => {
     try {
         const userId = req.user.id;
-        
+
         // Activity from student attendance
         const [attendanceLogs] = await db.execute(`
             SELECT DISTINCT a.date, 'Absensi Siswa' as activity, c.name as classroom_name, s.name as subject_name
@@ -1956,7 +1975,7 @@ app.get('/api/teacher/activity', protect, async (req, res) => {
 // ─── Dashboard Stats ───
 app.get('/api/teacher/dashboard-stats', protect, async (req, res) => {
     try {
-        const userId = req.user.id; 
+        const userId = req.user.id;
 
         // And number of students this teacher teaches (distinct students in their schedules)
         // Check `schedules` -> `classrooms` -> `students`
@@ -2014,7 +2033,7 @@ app.post('/api/teacher/classroom/:id/exams', protect, async (req, res) => {
     try {
         const { name, exam_date, description, subject_id } = req.body;
         const formattedDate = exam_date === '' ? null : exam_date;
-        
+
         // Find active academic year
         const [ays] = await db.execute('SELECT id, active_term FROM academic_years WHERE is_active = 1 LIMIT 1');
         const activeAY = ays[0];
@@ -2054,11 +2073,11 @@ app.get('/api/teacher/grades', protect, async (req, res) => {
             WHERE 1=1`;
         const params = [];
 
-        if (classroom_id)       { sql += ' AND sg.classroom_id = ?';        params.push(classroom_id); }
-        if (academic_year_id)   { sql += ' AND sg.academic_year_id = ?';    params.push(academic_year_id); }
-        if (term)               { sql += ' AND sg.term = ?';                params.push(term); }
-        if (type)               { sql += ' AND sg.type = ?';                params.push(type); }
-        if (classroom_exam_id)  { sql += ' AND sg.classroom_exam_id = ?';   params.push(classroom_exam_id); }
+        if (classroom_id) { sql += ' AND sg.classroom_id = ?'; params.push(classroom_id); }
+        if (academic_year_id) { sql += ' AND sg.academic_year_id = ?'; params.push(academic_year_id); }
+        if (term) { sql += ' AND sg.term = ?'; params.push(term); }
+        if (type) { sql += ' AND sg.type = ?'; params.push(type); }
+        if (classroom_exam_id) { sql += ' AND sg.classroom_exam_id = ?'; params.push(classroom_exam_id); }
 
         sql += ' ORDER BY s.name ASC';
         const [rows] = await db.execute(sql, params);
@@ -2102,9 +2121,9 @@ app.post('/api/teacher/grades', protect, async (req, res) => {
                 (student_id, subject_id, teacher_id, academic_year_id, semester, term, type, score, note, classroom_exam_id, classroom_id, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
             [student_id, subject_id, userId, academic_year_id,
-             semester || term || 1, term || semester || 1,
-             type, score, note || null,
-             classroom_exam_id || null, classroom_id || null]
+                semester || term || 1, term || semester || 1,
+                type, score, note || null,
+                classroom_exam_id || null, classroom_id || null]
         );
         res.json({ message: 'Nilai berhasil disimpan.', id: result.insertId, updated: false });
     } catch (err) {
@@ -2153,9 +2172,9 @@ app.post('/api/teacher/grades/bulk', protect, async (req, res) => {
                         (student_id, subject_id, teacher_id, academic_year_id, semester, term, type, score, note, classroom_exam_id, classroom_id, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
                     [student_id, subject_id, userId, academic_year_id,
-                     semester || term || 1, term || semester || 1,
-                     type, score, note || null,
-                     classroom_exam_id || null, classroom_id || null]
+                        semester || term || 1, term || semester || 1,
+                        type, score, note || null,
+                        classroom_exam_id || null, classroom_id || null]
                 );
                 saved++;
             }
@@ -2198,7 +2217,7 @@ app.get('/api/teacher/classroom/:id/report-summary', protect, async (req, res) =
         const params = [classroomId];
 
         if (academic_year_id) { gradesSql += ' AND sg.academic_year_id = ?'; params.push(academic_year_id); }
-        if (term)             { gradesSql += ' AND sg.term = ?';             params.push(term); }
+        if (term) { gradesSql += ' AND sg.term = ?'; params.push(term); }
 
         const [grades] = await db.execute(gradesSql, params);
 
@@ -2267,7 +2286,7 @@ app.get('/api/teacher/student/:studentId/report', protect, async (req, res) => {
         const params = [studentId];
 
         if (academic_year_id) { gradesSql += ' AND sg.academic_year_id = ?'; params.push(academic_year_id); }
-        if (term)             { gradesSql += ' AND sg.term = ?';             params.push(term); }
+        if (term) { gradesSql += ' AND sg.term = ?'; params.push(term); }
         gradesSql += ' ORDER BY sub.name, sg.type';
 
         const [grades] = await db.execute(gradesSql, params);
@@ -2378,7 +2397,7 @@ app.post('/api/teacher/student/:studentId/publish-report', protect, async (req, 
                     INSERT INTO academic_reports (student_id, academic_year_id, semester, subject_id, grade, note, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())`,
                     [studentId, academic_year_id, semester, grade.subject_id,
-                     Math.round(grade.subject_avg * 10) / 10, note || null]
+                        Math.round(grade.subject_avg * 10) / 10, note || null]
                 );
             }
         }
@@ -2439,8 +2458,8 @@ app.post('/api/teacher/student/:studentId/promote', protect, async (req, res) =>
                 (student_id, classroom_id, academic_year_id, is_promoted, homeroom_decision_note, note, start_date, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, CURDATE(), NOW(), NOW())`,
             [studentId, currentClass.id, academic_year_id || null,
-             is_promoted ? 1 : 0, decision_note || null,
-             is_promoted ? `Naik kelas dari ${currentClass.current_class_name}` : `Tidak naik kelas, tetap di ${currentClass.current_class_name}`]
+                is_promoted ? 1 : 0, decision_note || null,
+                is_promoted ? `Naik kelas dari ${currentClass.current_class_name}` : `Tidak naik kelas, tetap di ${currentClass.current_class_name}`]
         );
 
         // If promoted and next_classroom_id provided, move student
@@ -2517,7 +2536,7 @@ app.post('/api/platform/onboard', async (req, res) => {
     try {
         const { email, name } = req.body;
         if (!email || !name) return res.status(400).json({ message: 'Email dan nama pesantren diperlukan' });
-        
+
         const subAcc = await createPesantrenSubAccount(email, name);
         res.json({ message: 'Sub-account berhasil dibuat', data: subAcc });
     } catch (err) {
@@ -2531,8 +2550,8 @@ app.post('/api/platform/invoice', protect, async (req, res) => {
         const { subAccountId, transactionId, totalAmount, platformFee, description, payerEmail } = req.body;
         const invoice = await createSplitPaymentInvoice(subAccountId, { transactionId, totalAmount, platformFee, description, payerEmail });
         res.json({ invoice_url: invoice.invoice_url, external_id: transactionId, xendit_id: invoice.id });
-    } catch(err) {
-         res.status(500).json({ error: 'Gagal membuat split payment invoice.' });
+    } catch (err) {
+        res.status(500).json({ error: 'Gagal membuat split payment invoice.' });
     }
 });
 
@@ -2540,9 +2559,9 @@ app.post('/api/platform/payout', protect, async (req, res) => {
     try {
         const { subAccountId, referenceId, bankCode, accountName, accountNumber, amount } = req.body;
         const disbursement = await withdrawPesantrenBalance(subAccountId, { referenceId, bankCode, accountName, accountNumber, amount });
-         res.json({ message: 'Penarikan diproses', data: disbursement });
+        res.json({ message: 'Penarikan diproses', data: disbursement });
     } catch (err) {
-         res.status(500).json({ error: err.message || 'Gagal' });
+        res.status(500).json({ error: err.message || 'Gagal' });
     }
 });
 
@@ -2568,7 +2587,7 @@ app.patch('/api/super/pesantren/:id/fee', protectSuper, async (req, res) => {
         if (platform_fee === undefined) return res.status(400).json({ message: 'platform_fee is required' });
 
         await db.execute('UPDATE pesantrens SET platform_fee = ? WHERE id = ?', [platform_fee, id]);
-        
+
         res.json({ message: `Success update platform fee for Pesantren #${id} to ${platform_fee}` });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -2584,7 +2603,7 @@ app.patch('/api/super/pesantren/:id/xendit', protectSuper, async (req, res) => {
         if (!sub_account_id) return res.status(400).json({ message: 'sub_account_id is required' });
 
         await db.execute('UPDATE pesantrens SET xendit_sub_account_id = ?, xendit_status = "active" WHERE id = ?', [sub_account_id, id]);
-        
+
         res.json({ message: `Success update Sub-Account ID for Pesantren #${id}` });
     } catch (err) {
         res.status(500).json({ error: err.message });
