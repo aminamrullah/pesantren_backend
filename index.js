@@ -9,6 +9,7 @@ const hpp = require('hpp');
 const jwt = require('jsonwebtoken');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
+const xss = require('xss-clean');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -57,8 +58,18 @@ const limiter = rateLimit({
     message: 'Too many requests from this IP, please try again after 15 minutes.'
 });
 app.use('/api/', limiter);
+app.use(xss());
 
-const allowedOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim()) : ['http://localhost:5173'];
+const loginLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 10, // Limit each IP to 10 login attempts per windowMs
+    message: { message: 'Terlalu banyak upaya login. Silakan coba lagi setelah 15 menit.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+app.use('/api/login', loginLimiter);
+
+const allowedOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim()) : ['http://localhost:5173', 'http://localhost:5174'];
 app.use(cors({
     origin: (origin, callback) => {
         if (!origin || allowedOrigins.includes(origin)) {
@@ -140,7 +151,7 @@ const protectAdmin = async (req, res, next) => {
 
 app.post('/api/login', async (req, res) => {
     try {
-        const { phone, password } = req.body;
+        const { phone, password, app_type } = req.body;
         if (!phone || !password) return res.status(400).json({ message: 'Input tidak lengkap.' });
 
         const [users] = await db.execute(`
@@ -150,8 +161,6 @@ app.post('/api/login', async (req, res) => {
             LEFT JOIN roles r ON mhr.role_id = r.id
             LEFT JOIN teachers t ON u.id = t.user_id
             WHERE u.phone = ? OR u.email = ?`, ['App\\Models\\User', phone, phone]);
-
-        console.log(`[LOGIN DEBUG] Phone: ${phone}, Found: ${users.length}, Role: ${users[0]?.role}`);
 
         if (users.length === 0) return res.status(401).json({ message: 'Nomor WhatsApp tidak terdaftar.' });
 
@@ -174,18 +183,20 @@ app.post('/api/login', async (req, res) => {
             WHERE s.parent_phone = ?`, [user.phone || phone]);
 
         // Authorization Logic:
-        // 1. If has 'Wali' role -> OK
-        // 2. If has students -> OK (this covers Teachers/Admins who are also Parents)
-        // 3. Admin bypass (typically included for management/testing)
         const isWali = userRoles.includes('Wali');
+        const isTeacher = userRoles.includes('Teacher');
         const isAdmin = userRoles.includes('Admin');
         const isParent = students.length > 0;
 
-        if (!isWali && !isParent && !isAdmin) {
-            console.log(`[LOGIN REJECTED] User ${user.name} (${phone}) - Roles: ${userRoles.join(',')}, Students: ${students.length}`);
-            return res.status(403).json({
-                message: 'Akses ditolak. Aplikasi ini hanya dapat diakses oleh Wali Santri.'
-            });
+        // Restriction based on app_type
+        if (app_type === 'walisantri') {
+            if (!isWali && !isParent && !isAdmin) {
+                return res.status(403).json({ message: 'Akses ditolak. Aplikasi ini hanya dapat diakses oleh Wali Santri.' });
+            }
+        } else if (app_type === 'guru') {
+            if (!isTeacher && !isAdmin) {
+                return res.status(403).json({ message: 'Akses ditolak. Aplikasi ini hanya dapat diakses oleh Guru.' });
+            }
         }
 
         const token = jwt.sign(
