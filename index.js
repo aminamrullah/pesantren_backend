@@ -70,9 +70,16 @@ app.use('/api/login', loginLimiter);
 const allowedOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim()) : ['http://localhost:5173', 'http://localhost:5174'];
 app.use(cors({
     origin: (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin)) {
+        // Allow mobile apps (Capacitor/Cordova) and local development
+        if (!origin || 
+            allowedOrigins.includes(origin) || 
+            origin.includes('localhost') || 
+            origin.startsWith('capacitor://') ||
+            origin.startsWith('http://localhost') ||
+            origin.startsWith('https://localhost')) {
             callback(null, true);
         } else {
+            console.log('[CORS REJECTED]', origin);
             callback(new Error('Origin not allowed by CORS'));
         }
     },
